@@ -364,8 +364,6 @@
 
         .complete-btn { background-color: var(--success-color); }
         .complete-btn:active { background-color: #3e8e41; }
-        .archive-btn { background-color: var(--accent-color); }
-        .archive-btn:active { background-color: #3ab7f5; }
         .delete-btn { background-color: var(--danger-color); }
         .delete-btn:active { background-color: #d32f2f; }
         .restore-btn { background-color: #9e9e9e; }
@@ -396,6 +394,9 @@
             z-index: 999;
             animation: fadeIn 0.3s ease-out;
             box-shadow: var(--box-shadow);
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
 
         .sync-indicator.syncing {
@@ -404,6 +405,10 @@
 
         .sync-indicator.error {
             background-color: var(--danger-color);
+        }
+
+        .sync-indicator.offline {
+            background-color: #ff6f00;
         }
 
         @media (max-width: 768px) {
@@ -531,7 +536,6 @@
             }
         }
 
-        /* PWA Install Prompt */
         .install-prompt {
             display: none;
             position: fixed;
@@ -572,6 +576,15 @@
                 padding-bottom: max(0px, env(safe-area-inset-bottom));
             }
         }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        .spin {
+            animation: spin 1s linear infinite;
+        }
     </style>
 </head>
 <body>
@@ -588,15 +601,8 @@
     </div>
 
     <div id="syncIndicator" class="sync-indicator" style="display: none;">
-        <i class="fas fa-sync-alt" style="animation: spin 1s linear infinite;"></i> Synchronizacja...
+        <i class="fas fa-sync-alt spin"></i> <span id="syncText">Synchronizacja...</span>
     </div>
-
-    <style>
-        @keyframes spin {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
-        }
-    </style>
 
     <div id="loginSection" class="login-section">
         <div class="login-box">
@@ -708,18 +714,183 @@
 
     <script>
         const PASSWORD = "Kontrola";
+        const SUPABASE_URL = 'https://dhnkwzhglnavfeknhvok.supabase.co';
+        const SUPABASE_KEY = 'sb_publishable_PGzf6cIzXrPzj_SdX8_rKQ_guyTO_yt';
+        const TASKS_API = `${SUPABASE_URL}/rest/v1/tasks`;
+
         let tasks = [];
         let isLoggedIn = false;
         let deferredPrompt = null;
+        let syncQueue = [];
+        let isSyncing = false;
 
-        // PWA - Rejestracja service workera
+        // Supabase API functions
+        async function supabaseRequest(path = '', options = {}) {
+            try {
+                const response = await fetch(`${TASKS_API}${path}`, {
+                    ...options,
+                    headers: {
+                        apikey: SUPABASE_KEY,
+                        Authorization: `Bearer ${SUPABASE_KEY}`,
+                        'Content-Type': 'application/json',
+                        Prefer: 'return=representation',
+                        ...(options.headers || {})
+                    }
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return response.status === 204 ? null : response.json();
+            } catch (error) {
+                console.error('API Error:', error);
+                showSyncIndicator('error');
+                throw error;
+            }
+        }
+
+        async function loadTasksFromCloud() {
+            try {
+                const data = await supabaseRequest('?select=*&order=updated_at.desc');
+                return (data || []).map(row => ({
+                    id: row.id,
+                    orderDate: row.order_date,
+                    assignedTo: row.assigned_to,
+                    assignedBy: row.assigned_by,
+                    description: row.description,
+                    deadline: row.deadline,
+                    status: row.status,
+                    notes: row.notes || '',
+                    completionDate: row.completion_date
+                }));
+            } catch (error) {
+                console.error('Failed to load from cloud:', error);
+                return loadTasksFromLocal();
+            }
+        }
+
+        async function saveTaskToCloud(task) {
+            if (!navigator.onLine) {
+                syncQueue.push({ action: 'save', task: JSON.parse(JSON.stringify(task)) });
+                return;
+            }
+
+            try {
+                const row = {
+                    id: task.id,
+                    order_date: task.orderDate,
+                    assigned_to: task.assignedTo,
+                    assigned_by: task.assignedBy,
+                    description: task.description,
+                    deadline: task.deadline,
+                    status: task.status === 'overdue' ? 'pending' : task.status,
+                    notes: task.notes || '',
+                    completion_date: task.completionDate || null,
+                    updated_at: new Date().toISOString()
+                };
+                await supabaseRequest('?on_conflict=id', {
+                    method: 'POST',
+                    body: JSON.stringify(row),
+                    headers: { Prefer: 'resolution=merge-duplicates,return=representation' }
+                });
+                showSyncIndicator('synced');
+            } catch (error) {
+                console.error('Failed to save to cloud:', error);
+                syncQueue.push({ action: 'save', task: JSON.parse(JSON.stringify(task)) });
+                throw error;
+            }
+        }
+
+        async function deleteTaskFromCloud(id) {
+            if (!navigator.onLine) {
+                syncQueue.push({ action: 'delete', taskId: id });
+                return;
+            }
+
+            try {
+                await supabaseRequest(`?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE' });
+                showSyncIndicator('synced');
+            } catch (error) {
+                console.error('Failed to delete from cloud:', error);
+                syncQueue.push({ action: 'delete', taskId: id });
+                throw error;
+            }
+        }
+
+        // Local storage functions
+        function saveTasks() {
+            localStorage.setItem('stockControlTasks', JSON.stringify(tasks));
+            localStorage.setItem('stockControlLastSave', new Date().toISOString());
+        }
+
+        function loadTasksFromLocal() {
+            const savedTasks = localStorage.getItem('stockControlTasks');
+            return savedTasks ? JSON.parse(savedTasks) : [];
+        }
+
+        // UI functions
+        function showSyncIndicator(status) {
+            const indicator = document.getElementById('syncIndicator');
+            const text = document.getElementById('syncText');
+            indicator.style.display = 'flex';
+            indicator.className = 'sync-indicator ' + status;
+            
+            if (status === 'syncing') text.textContent = 'Synchronizacja...';
+            else if (status === 'synced') text.textContent = 'Zsynchronizowane ✓';
+            else if (status === 'error') text.textContent = 'Błąd synchronizacji';
+            else if (status === 'offline') text.textContent = 'Tryb offline';
+
+            if (status === 'synced') {
+                setTimeout(() => {
+                    indicator.style.display = 'none';
+                }, 2000);
+            }
+        }
+
+        function login() {
+            const enteredPassword = document.getElementById("password").value;
+            const errorMessage = document.getElementById("errorMessage");
+
+            if (enteredPassword === PASSWORD) {
+                isLoggedIn = true;
+                localStorage.setItem('stockControlLoggedIn', 'true');
+                document.getElementById("loginSection").style.display = "none";
+                document.getElementById("mainContent").style.display = "block";
+                loadTasks();
+                renderTasks();
+                renderArchive();
+                document.getElementById("userDisplay").textContent = "Zalogowany";
+            } else {
+                errorMessage.textContent = "❌ Nieprawidłowe hasło!";
+            }
+        }
+
+        function logout() {
+            isLoggedIn = false;
+            localStorage.removeItem('stockControlLoggedIn');
+            document.getElementById("loginSection").style.display = "flex";
+            document.getElementById("mainContent").style.display = "none";
+            document.getElementById("password").value = "";
+            document.getElementById("errorMessage").textContent = "";
+        }
+
+        function toggleTheme() {
+            document.documentElement.classList.toggle("dark");
+            localStorage.setItem('stockControlTheme', document.documentElement.classList.contains("dark") ? 'dark' : 'light');
+            const icon = document.querySelector(".theme-toggle i");
+            if (document.documentElement.classList.contains("dark")) {
+                icon.classList.remove("fa-moon");
+                icon.classList.add("fa-sun");
+            } else {
+                icon.classList.remove("fa-sun");
+                icon.classList.add("fa-moon");
+            }
+        }
+
+        // PWA functions
         if ('serviceWorker' in navigator) {
             navigator.serviceWorker.register('sw.js').catch(err => {
                 console.log('Service Worker registration failed:', err);
             });
         }
 
-        // PWA - Install prompt
         window.addEventListener('beforeinstallprompt', (e) => {
             e.preventDefault();
             deferredPrompt = e;
@@ -742,160 +913,19 @@
             document.getElementById('installPrompt').classList.remove('show');
         }
 
-        // Auto-save przy każdej zmianie
-        function saveTasks() {
+        // Main app functions
+        async function loadTasks() {
             showSyncIndicator('syncing');
-            localStorage.setItem('stockControlTasks', JSON.stringify(tasks));
-            localStorage.setItem('stockControlLastSave', new Date().toISOString());
-            
-            setTimeout(() => {
-                showSyncIndicator('synced');
-                setTimeout(() => {
-                    document.getElementById('syncIndicator').style.display = 'none';
-                }, 2000);
-            }, 300);
-        }
-
-        function showSyncIndicator(status) {
-            const indicator = document.getElementById('syncIndicator');
-            indicator.style.display = 'flex';
-            indicator.className = 'sync-indicator ' + status;
-        }
-
-        function login() {
-            const enteredPassword = document.getElementById("password").value;
-            const errorMessage = document.getElementById("errorMessage");
-
-            if (enteredPassword === PASSWORD) {
-                isLoggedIn = true;
-                localStorage.setItem('stockControlLoggedIn', 'true');
-                localStorage.setItem('stockControlPassword', PASSWORD);
-                document.getElementById("loginSection").style.display = "none";
-                document.getElementById("mainContent").style.display = "block";
-                loadTasks();
-                renderTasks();
-                renderArchive();
-                document.getElementById("userDisplay").textContent = "Zalogowany: " + new Date().toLocaleTimeString('pl-PL', { hour: '2-digit', minute: '2-digit' });
-            } else {
-                errorMessage.textContent = "❌ Nieprawidłowe hasło!";
-            }
-        }
-
-        function logout() {
-            isLoggedIn = false;
-            localStorage.removeItem('stockControlLoggedIn');
-            localStorage.removeItem('stockControlPassword');
-            document.getElementById("loginSection").style.display = "flex";
-            document.getElementById("mainContent").style.display = "none";
-            document.getElementById("password").value = "";
-            document.getElementById("errorMessage").textContent = "";
-        }
-
-        function toggleTheme() {
-            document.documentElement.classList.toggle("dark");
-            localStorage.setItem('stockControlTheme', document.documentElement.classList.contains("dark") ? 'dark' : 'light');
-            const icon = document.querySelector(".theme-toggle i");
-            if (document.documentElement.classList.contains("dark")) {
-                icon.classList.remove("fa-moon");
-                icon.classList.add("fa-sun");
-            } else {
-                icon.classList.remove("fa-sun");
-                icon.classList.add("fa-moon");
-            }
-        }
-
-        document.addEventListener('DOMContentLoaded', () => {
-            // Wczytaj motyw
-            const savedTheme = localStorage.getItem('stockControlTheme');
-            if (savedTheme === 'dark') {
-                document.documentElement.classList.add('dark');
-                document.querySelector(".theme-toggle i").classList.remove("fa-moon");
-                document.querySelector(".theme-toggle i").classList.add("fa-sun");
-            }
-
-            // Ustaw dzisiejszą datę
-            const today = new Date().toISOString().split('T')[0];
-            document.getElementById('orderDate').value = today;
-
-            const savedLoggedIn = localStorage.getItem('stockControlLoggedIn');
-            if (savedLoggedIn === 'true') {
-                isLoggedIn = true;
-                document.getElementById("loginSection").style.display = "none";
-                document.getElementById("mainContent").style.display = "block";
-                loadTasks();
-                renderTasks();
-                renderArchive();
-                document.getElementById("userDisplay").textContent = "Zalogowany";
-            }
-
-            // Sprawdzaj synchronizację co 5 sekund
-            setInterval(checkLastSave, 5000);
-        });
-
-        function checkLastSave() {
-            const lastSave = localStorage.getItem('stockControlLastSave');
-            if (lastSave) {
-                const saveTime = new Date(lastSave);
-                const now = new Date();
-                const diffSeconds = Math.floor((now - saveTime) / 1000);
-                
-                if (diffSeconds < 10) {
-                    showSyncIndicator('synced');
-                } else if (diffSeconds > 300) {
-                    showSyncIndicator('error');
-                }
-            }
-        }
-
-        function loadTasks() {
-            const savedTasks = localStorage.getItem('stockControlTasks');
-            if (savedTasks) {
-                tasks = JSON.parse(savedTasks);
-            } else {
-                tasks = [
-                    {
-                        id: 1,
-                        orderDate: "2026-09-20",
-                        assignedTo: "Magdalena Kowalska",
-                        assignedBy: "Janusz Nowak",
-                        description: "Sprawdzić stan magazynu części A1-B5",
-                        deadline: "2026-09-25",
-                        status: "pending",
-                        notes: "Priorytet: wysoki",
-                        completionDate: null
-                    },
-                    {
-                        id: 2,
-                        orderDate: "2026-09-18",
-                        assignedTo: "Dział Logistyki",
-                        assignedBy: "Anna Wiśniewska",
-                        description: "Zamówić nowe opakowania foliowe",
-                        deadline: "2026-09-22",
-                        status: "completed",
-                        notes: "Zrealizowano w terminie",
-                        completionDate: "2026-09-20"
-                    },
-                    {
-                        id: 3,
-                        orderDate: "2026-09-15",
-                        assignedTo: "Piotr Lewandowski",
-                        assignedBy: "Magdalena Kowalska",
-                        description: "Przeprowadzić inwentaryzację półki C7-D3",
-                        deadline: "2026-09-24",
-                        status: "overdue",
-                        notes: "Opóźnienie spowodowane brakiem pracownika",
-                        completionDate: null
-                    }
-                ];
-                saveTasks();
-            }
+            tasks = await loadTasksFromCloud();
+            saveTasks();
+            showSyncIndicator('synced');
         }
 
         function generateId() {
             return Date.now();
         }
 
-        function addTask() {
+        async function addTask() {
             if (!isLoggedIn) return;
 
             const orderDate = document.getElementById("orderDate").value;
@@ -928,6 +958,13 @@
             renderArchive();
             document.getElementById("taskForm").reset();
             document.getElementById("orderDate").value = new Date().toISOString().split('T')[0];
+
+            showSyncIndicator('syncing');
+            try {
+                await saveTaskToCloud(newTask);
+            } catch (error) {
+                console.error('Error adding task:', error);
+            }
         }
 
         function renderTasks() {
@@ -937,7 +974,7 @@
             tasksBody.innerHTML = "";
 
             tasks.forEach(task => {
-                if (task.status !== "completed" && task.status !== "archived") {
+                if (task.status !== "completed") {
                     const row = document.createElement("tr");
 
                     const today = new Date();
@@ -1006,7 +1043,7 @@
             });
         }
 
-        function completeTask(id) {
+        async function completeTask(id) {
             if (!isLoggedIn) return;
 
             const task = tasks.find(t => t.id === id);
@@ -1016,10 +1053,17 @@
                 saveTasks();
                 renderTasks();
                 renderArchive();
+
+                showSyncIndicator('syncing');
+                try {
+                    await saveTaskToCloud(task);
+                } catch (error) {
+                    console.error('Error completing task:', error);
+                }
             }
         }
 
-        function restoreTask(id) {
+        async function restoreTask(id) {
             if (!isLoggedIn) return;
 
             const task = tasks.find(t => t.id === id);
@@ -1029,25 +1073,46 @@
                 saveTasks();
                 renderTasks();
                 renderArchive();
+
+                showSyncIndicator('syncing');
+                try {
+                    await saveTaskToCloud(task);
+                } catch (error) {
+                    console.error('Error restoring task:', error);
+                }
             }
         }
 
-        function permanentDeleteTask(id) {
+        async function permanentDeleteTask(id) {
             if (!isLoggedIn) return;
             if (confirm("Czy na pewno chcesz usunąć to zadanie na stałe?")) {
                 tasks = tasks.filter(t => t.id !== id);
                 saveTasks();
                 renderArchive();
+
+                showSyncIndicator('syncing');
+                try {
+                    await deleteTaskFromCloud(id);
+                } catch (error) {
+                    console.error('Error deleting task:', error);
+                }
             }
         }
 
-        function deleteTask(id) {
+        async function deleteTask(id) {
             if (!isLoggedIn) return;
             if (confirm("Czy na pewno chcesz usunąć to zadanie?")) {
                 tasks = tasks.filter(t => t.id !== id);
                 saveTasks();
                 renderTasks();
                 renderArchive();
+
+                showSyncIndicator('syncing');
+                try {
+                    await deleteTaskFromCloud(id);
+                } catch (error) {
+                    console.error('Error deleting task:', error);
+                }
             }
         }
 
@@ -1073,12 +1138,59 @@
             });
         }
 
-        // Synchronizacja danych między kartami
-        window.addEventListener('storage', (e) => {
-            if (e.key === 'stockControlTasks' && isLoggedIn) {
+        // Synchronization on network change
+        window.addEventListener('online', async () => {
+            showSyncIndicator('syncing');
+            await loadTasks();
+            renderTasks();
+            renderArchive();
+        });
+
+        window.addEventListener('offline', () => {
+            showSyncIndicator('offline');
+        });
+
+        // Periodic sync
+        setInterval(async () => {
+            if (isLoggedIn && navigator.onLine && !isSyncing) {
+                isSyncing = true;
+                try {
+                    await loadTasks();
+                    renderTasks();
+                    renderArchive();
+                } catch (error) {
+                    console.error('Periodic sync failed:', error);
+                } finally {
+                    isSyncing = false;
+                }
+            }
+        }, 5000);
+
+        // Initial load
+        document.addEventListener('DOMContentLoaded', () => {
+            const savedTheme = localStorage.getItem('stockControlTheme');
+            if (savedTheme === 'dark') {
+                document.documentElement.classList.add('dark');
+                document.querySelector(".theme-toggle i").classList.remove("fa-moon");
+                document.querySelector(".theme-toggle i").classList.add("fa-sun");
+            }
+
+            const today = new Date().toISOString().split('T')[0];
+            document.getElementById('orderDate').value = today;
+
+            const savedLoggedIn = localStorage.getItem('stockControlLoggedIn');
+            if (savedLoggedIn === 'true') {
+                isLoggedIn = true;
+                document.getElementById("loginSection").style.display = "none";
+                document.getElementById("mainContent").style.display = "block";
                 loadTasks();
                 renderTasks();
                 renderArchive();
+                document.getElementById("userDisplay").textContent = "Zalogowany";
+            }
+
+            if (!navigator.onLine) {
+                showSyncIndicator('offline');
             }
         });
     </script>
